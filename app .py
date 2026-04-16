@@ -91,9 +91,11 @@ with st.sidebar:
                 )
 
             with st.spinner("Setting up chat chain..."):
+                # Use entered key or fall back to Streamlit secret
+                final_key = groq_key if groq_key else st.secrets.get("GROQ_API_KEY", "")
                 llm = ChatGroq(
                     model="llama-3.1-8b-instant",
-                    api_key=groq_key,
+                    api_key=final_key,
                     temperature=0.0
                 )
 
