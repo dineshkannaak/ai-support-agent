@@ -12,17 +12,30 @@ from sentence_transformers import CrossEncoder
 
 st.set_page_config(page_title="Support Agent", page_icon="🤖")
 st.title("AI Customer Support Agent")
+st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-@st.cache_resource
-def load_pipeline():
+# ── Sidebar: user provides their own key and document ──
+with st.sidebar:
+    st.header("Setup")
+    user_api_key = st.text_input(
+        "Groq API Key",
+        type="password",
+        help="Get a free key at console.groq.com"
+    )
+    uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+    st.divider()
+    st.caption("Your key and document are only used for this session and are not stored.")
+
+
+@st.cache_resource(show_spinner="Building knowledge base...")
+def load_pipeline(api_key, pdf_path):
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
-        api_key=st.secrets["GROQ_API_KEY"],
+        api_key=api_key,
         temperature=0.0
     )
 
-    # IMPORTANT: this filename must EXACTLY match a file sitting in your repo root
-    loader = PyPDFLoader("knowledge-base.pdf.pdf")
+    loader = PyPDFLoader(pdf_path)
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
@@ -74,23 +87,43 @@ def load_pipeline():
         history_messages_key="chat_history"
     )
 
-chain = load_pipeline()
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ── Main app logic ──
+if user_api_key and uploaded_file:
+    # PyPDFLoader needs a real file path, so save the upload to disk first
+    temp_pdf_path = "temp_uploaded.pdf"
+    with open(temp_pdf_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
 
-for msg in st.session_state.messages:
-    st.chat_message(msg["role"]).write(msg["content"])
+    try:
+        chain = load_pipeline(user_api_key, temp_pdf_path)
+    except Exception as e:
+        st.error(f"Something went wrong setting up the pipeline: {e}")
+        st.stop()
 
-user_input = st.chat_input("Ask a question about the document...")
-if user_input:
-    st.session_state.messages.append({"role": "human", "content": user_input})
-    st.chat_message("human").write(user_input)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    answer = chain.invoke(
-        {"question": user_input},
-        config={"configurable": {"session_id": "streamlit_session"}}
-    )
-    st.session_state.messages.append({"role": "ai", "content": answer})
-    st.chat_message("ai").write(answer)
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
 
+    user_input = st.chat_input("Ask a question about the document...")
+    if user_input:
+        st.session_state.messages.append({"role": "human", "content": user_input})
+        st.chat_message("human").write(user_input)
+
+        with st.spinner("Thinking..."):
+            answer = chain.invoke(
+                {"question": user_input},
+                config={"configurable": {"session_id": "streamlit_session"}}
+            )
+
+        st.session_state.messages.append({"role": "ai", "content": answer})
+        st.chat_message("ai").write(answer)
+
+elif user_api_key and not uploaded_file:
+    st.info("👈 Now upload a PDF in the sidebar to get started.")
+elif uploaded_file and not user_api_key:
+    st.info("👈 Now enter your Groq API key in the sidebar to get started.")
+else:
+    st.info("👈 Enter your Groq API key and upload a PDF in the sidebar to get started.")
