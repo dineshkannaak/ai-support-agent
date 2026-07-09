@@ -22,7 +22,7 @@ def load_pipeline():
     )
 
     # IMPORTANT: this filename must EXACTLY match a file sitting in your repo root
-    loader = PyPDFLoader("knowledge-base.pdf")
+    loader = PyPDFLoader("knowledge-base.pdf.pdf")
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
