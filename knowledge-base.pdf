@@ -1,3 +1,1 @@
-git add "knowledge-base.pdf"
-git commit -m "add source PDF for RAG pipeline"
-git push
+
