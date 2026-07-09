@@ -1,14 +1,3 @@
-
-import subprocess
-import sys
-
-# Auto install all required packages
-subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-    "langchain", "langchain-groq", "langchain-community",
-    "langchain-core", "langchain-text-splitters",
-    "chromadb", "sentence-transformers", "pypdf", "python-dotenv"
-], check=True)
-
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader
@@ -32,7 +21,8 @@ def load_pipeline():
         temperature=0.0
     )
 
-    loader = PyPDFLoader("PYTHON - tkinter.pdf")  # keep this PDF in your repo root
+    # IMPORTANT: this filename must EXACTLY match a file sitting in your repo root
+    loader = PyPDFLoader("knowledge-base.pdf")
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
@@ -43,13 +33,9 @@ def load_pipeline():
         documents=chunks, embedding=embeddings, persist_directory="./chroma_db"
     )
 
-    # NEW: re-ranker, loaded once via cache_resource
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-
-    # CHANGED: k=10 instead of k=3, since re-ranker narrows it down after
     retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
 
-    # NEW: re-ranking function
     def retrieve_and_rerank(query, top_k=3):
         candidates = retriever.invoke(query)
         if not candidates:
@@ -75,7 +61,7 @@ def load_pipeline():
 
     inner_chain = (
         {
-            "context": lambda x: retrieve_and_rerank(x["question"]),  # CHANGED from retriever.invoke(...)
+            "context": lambda x: retrieve_and_rerank(x["question"]),
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", [])
         }
@@ -107,3 +93,4 @@ if user_input:
     )
     st.session_state.messages.append({"role": "ai", "content": answer})
     st.chat_message("ai").write(answer)
+
