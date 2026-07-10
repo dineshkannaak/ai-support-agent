@@ -158,4 +158,4 @@ if "chain" in st.session_state:
         st.session_state.messages.append({"role": "ai", "content": answer})
         st.chat_message("ai").write(answer)
 else:
-    st.info("👈 Upload a PDF in the sidebar, then click **Build Knowledge Base** to get started.") sidebar to get started.")
+    st.info("👈 Upload a PDF in the sidebar, then click **Build Knowledge Base** to get started.")
