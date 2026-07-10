@@ -11,7 +11,11 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
 
-st.set_page_config(page_title="Support Agent", page_icon="🤖")
+st.set_page_config(
+    page_title="Support Agent",
+    page_icon="🤖",
+    initial_sidebar_state="expanded"
+)
 st.title("AI Customer Support Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
