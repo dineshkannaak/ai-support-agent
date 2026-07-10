@@ -1,3 +1,4 @@
+import hashlib
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader
@@ -14,21 +15,25 @@ st.set_page_config(page_title="Support Agent", page_icon="🤖")
 st.title("AI Customer Support Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-# ── Sidebar: user provides their own key and document ──
+# ── Sidebar: user provides their own key (optional) and document ──
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
-        "Groq API Key",
+        "Groq API Key (optional)",
         type="password",
-        help="Get a free key at console.groq.com"
+        help="Leave blank to use the demo's default key. Get your own free key at console.groq.com"
     )
     uploaded_file = st.file_uploader("Upload a PDF", type="pdf")
+    build_clicked = st.button("Build Knowledge Base", type="primary")
     st.divider()
     st.caption("Your key and document are only used for this session and are not stored.")
 
 
 @st.cache_resource(show_spinner="Building knowledge base...")
-def load_pipeline(api_key, pdf_path):
+def load_pipeline(api_key, pdf_path, file_hash):
+    # file_hash is unused inside the function body, but including it as an
+    # argument forces Streamlit to treat a new/changed file as a NEW cache
+    # entry instead of reusing a stale pipeline built from a previous file.
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
@@ -42,9 +47,11 @@ def load_pipeline(api_key, pdf_path):
     chunks = splitter.split_documents(docs)
 
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = Chroma.from_documents(
-        documents=chunks, embedding=embeddings, persist_directory="./chroma_db"
-    )
+
+    # NOTE: no persist_directory here on purpose — this keeps each session's
+    # vector store fully in-memory, so different users on a shared Streamlit
+    # Cloud instance never end up reading each other's documents.
+    vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
 
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
@@ -88,21 +95,47 @@ def load_pipeline(api_key, pdf_path):
     )
 
 
-# ── Main app logic ──
-if user_api_key and uploaded_file:
-    # PyPDFLoader needs a real file path, so save the upload to disk first
-    temp_pdf_path = "temp_uploaded.pdf"
-    with open(temp_pdf_path, "wb") as f:
-        f.write(uploaded_file.getvalue())
-
+# ── Resolve which API key to actually use ──
+def resolve_api_key(user_provided_key):
+    if user_provided_key:
+        return user_provided_key, "your own key"
     try:
-        chain = load_pipeline(user_api_key, temp_pdf_path)
-    except Exception as e:
-        st.error(f"Something went wrong setting up the pipeline: {e}")
-        st.stop()
+        return st.secrets["GROQ_API_KEY"], "the demo's default key"
+    except Exception:
+        return None, None
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+
+# ── Build step: only runs when the button is clicked ──
+if build_clicked:
+    if not uploaded_file:
+        st.sidebar.error("Please upload a PDF before building.")
+    else:
+        api_key, key_source = resolve_api_key(user_api_key)
+        if not api_key:
+            st.sidebar.error(
+                "No API key provided, and no default key is configured. "
+                "Please enter a Groq API key."
+            )
+        else:
+            file_bytes = uploaded_file.getvalue()
+            file_hash = hashlib.md5(file_bytes).hexdigest()  # changes whenever the file content changes
+
+            temp_pdf_path = "temp_uploaded.pdf"
+            with open(temp_pdf_path, "wb") as f:
+                f.write(file_bytes)
+
+            try:
+                st.session_state.chain = load_pipeline(api_key, temp_pdf_path, file_hash)
+                st.session_state.doc_name = uploaded_file.name
+                st.session_state.messages = []  # fresh conversation for the new document
+                st.sidebar.success(f"Knowledge base built using {key_source}.")
+            except Exception as e:
+                st.sidebar.error(f"Something went wrong building the pipeline: {e}")
+
+
+# ── Main chat area ──
+if "chain" in st.session_state:
+    st.caption(f"Currently answering from: **{st.session_state.doc_name}**")
 
     for msg in st.session_state.messages:
         st.chat_message(msg["role"]).write(msg["content"])
@@ -113,17 +146,12 @@ if user_api_key and uploaded_file:
         st.chat_message("human").write(user_input)
 
         with st.spinner("Thinking..."):
-            answer = chain.invoke(
+            answer = st.session_state.chain.invoke(
                 {"question": user_input},
                 config={"configurable": {"session_id": "streamlit_session"}}
             )
 
         st.session_state.messages.append({"role": "ai", "content": answer})
         st.chat_message("ai").write(answer)
-
-elif user_api_key and not uploaded_file:
-    st.info("👈 Now upload a PDF in the sidebar to get started.")
-elif uploaded_file and not user_api_key:
-    st.info("👈 Now enter your Groq API key in the sidebar to get started.")
 else:
-    st.info("👈 Enter your Groq API key and upload a PDF in the sidebar to get started.")
+    st.info("👈 Upload a PDF in the sidebar, then click **Build Knowledge Base** to get started.") sidebar to get started.")
