@@ -12,6 +12,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
+import time
 
 st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Document Q&A Agent")
@@ -30,6 +31,24 @@ with st.sidebar:
     st.divider()
     st.caption("Your key and document are only used for this session and are not stored.")
 
+def invoke_with_retry(chain, inputs, config, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return chain.invoke(inputs, config=config)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                return f"Sorry, the request failed after {max_retries} attempts: {e}"
+            time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
+
+with st.spinner("Thinking..."):
+    try:
+        answer = invoke_with_retry(
+            st.session_state.chain,
+            {"question": user_input},
+            config={"configurable": {"session_id": "streamlit_session"}}
+        )
+    except Exception as e:
+        answer = "Something went wrong processing that question. Please try again in a moment."
 
 def is_noise_chunk(text):
     # Filters out chunks that are mostly bracketed headings / cross-reference
@@ -82,17 +101,17 @@ def load_pipeline(api_key, pdf_path, file_hash):
     ])
     decompose_chain = decompose_prompt | llm | StrOutputParser()
 
-    def decompose_query(query):
-        try:
-            raw = decompose_chain.invoke({"question": query}).strip()
-            if raw.startswith("```"):
-                raw = raw.strip("`").replace("json", "", 1).strip()
-            sub_queries = json.loads(raw)
-            if isinstance(sub_queries, list) and sub_queries and all(isinstance(q, str) for q in sub_queries):
-                return sub_queries
-        except Exception:
-            pass
-        return [query]
+   def decompose_query(query):
+    try:
+        raw = decompose_chain.invoke({"question": query}).strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`").replace("json", "", 1).strip()
+        sub_queries = json.loads(raw)
+        if isinstance(sub_queries, list) and sub_queries and all(isinstance(q, str) for q in sub_queries):
+            return sub_queries[:3] 
+    except Exception:
+        pass
+    return [query]
 
     def retrieve_and_rerank(query, top_k=3):
         sub_queries = decompose_query(query)
