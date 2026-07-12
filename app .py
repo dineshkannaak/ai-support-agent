@@ -1,3 +1,4 @@
+import re
 import hashlib
 import streamlit as st
 from langchain_groq import ChatGroq
@@ -11,15 +12,11 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
 
-st.set_page_config(
-    page_title="Support Agent",
-    page_icon="🤖",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Customer Support Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-# ── Sidebar: user provides their own key (optional) and document ──
+#Sidebar: user provides their own key if they have and document
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
@@ -35,9 +32,9 @@ with st.sidebar:
 
 @st.cache_resource(show_spinner="Building knowledge base...")
 def load_pipeline(api_key, pdf_path, file_hash):
-    # file_hash is unused inside the function body, but including it as an
-    # argument forces Streamlit to treat a new/changed file as a NEW cache
-    # entry instead of reusing a stale pipeline built from a previous file.
+    # file_hash forces a new cache entry whenever the uploaded file's
+    # content changes, so swapping documents doesn't silently reuse
+    # a pipeline built from the previous file.
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
@@ -47,32 +44,74 @@ def load_pipeline(api_key, pdf_path, file_hash):
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
 
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-    # NOTE: no persist_directory here on purpose — this keeps each session's
-    # vector store fully in-memory, so different users on a shared Streamlit
-    # Cloud instance never end up reading each other's documents.
+    # No persist_directory — keeps each session's vector store fully
+    # in-memory, so different users on a shared server never end up
+    # reading each other's documents.
     vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
 
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
 
     def retrieve_and_rerank(query, top_k=3):
         candidates = retriever.invoke(query)
+
+        # Hybrid fix: pure semantic search often misses exact section/ID
+        # lookups, since digits don't carry much semantic meaning for an
+        # embedding model. If the query references a specific numbered
+        # section, force-include any chunk that literally starts with
+        # that number so it can't be missed regardless of phrasing.
+        section_match = re.search(r'\bsection\s+(\d{1,3})\b', query, re.IGNORECASE)
+        if not section_match:
+            section_match = re.search(r'\b(\d{1,3})\b', query)
+
+        if section_match:
+            section_num = section_match.group(1)
+            for chunk in chunks:
+                stripped = chunk.page_content.strip()
+                if stripped.startswith(f"{section_num}.") or f"\n{section_num}." in chunk.page_content:
+                    if chunk not in candidates:
+                        candidates.append(chunk)
+
         if not candidates:
             return []
+
         pairs = [[query, doc.page_content] for doc in candidates]
         scores = reranker.predict(pairs)
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
         return [doc for doc, score in ranked[:top_k]]
 
+    # Query contextualization: rewrite follow-up questions (with
+    # pronouns like "it" or "that") into standalone questions before
+    # retrieval, so retrieval isn't blind to the conversation history.
+    contextualize_prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Given the conversation history and a follow-up question, rewrite the "
+         "follow-up question as a standalone question that includes all necessary "
+         "context from the history. If it's already standalone, return it unchanged. "
+         "Output ONLY the rewritten question, nothing else."),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{question}")
+    ])
+    contextualize_chain = contextualize_prompt | llm | StrOutputParser()
+
+    def get_standalone_question(x):
+        if not x.get("chat_history"):
+            return x["question"]
+        return contextualize_chain.invoke({
+            "chat_history": x["chat_history"],
+            "question": x["question"]
+        })
+
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful assistant. Answer ONLY using the context below. "
-         "If not in context say: I don't know.\n\nContext: {context}"),
+         "If the answer is not in the context, say: I don't know, that information "
+         "is not in the document.\n\nContext: {context}"),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{question}")
     ])
@@ -85,7 +124,7 @@ def load_pipeline(api_key, pdf_path, file_hash):
 
     inner_chain = (
         {
-            "context": lambda x: retrieve_and_rerank(x["question"]),
+            "context": lambda x: retrieve_and_rerank(get_standalone_question(x)),
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", [])
         }
@@ -99,7 +138,7 @@ def load_pipeline(api_key, pdf_path, file_hash):
     )
 
 
-# ── Resolve which API key to actually use ──
+# Resolve which API key to actually use 
 def resolve_api_key(user_provided_key):
     if user_provided_key:
         return user_provided_key, "your own key"
@@ -109,7 +148,7 @@ def resolve_api_key(user_provided_key):
         return None, None
 
 
-# ── Build step: only runs when the button is clicked ──
+# Build step: only runs when the button is clicked 
 if build_clicked:
     if not uploaded_file:
         st.sidebar.error("Please upload a PDF before building.")
@@ -122,7 +161,7 @@ if build_clicked:
             )
         else:
             file_bytes = uploaded_file.getvalue()
-            file_hash = hashlib.md5(file_bytes).hexdigest()  # changes whenever the file content changes
+            file_hash = hashlib.md5(file_bytes).hexdigest()
 
             temp_pdf_path = "temp_uploaded.pdf"
             with open(temp_pdf_path, "wb") as f:
@@ -131,13 +170,12 @@ if build_clicked:
             try:
                 st.session_state.chain = load_pipeline(api_key, temp_pdf_path, file_hash)
                 st.session_state.doc_name = uploaded_file.name
-                st.session_state.messages = []  # fresh conversation for the new document
+                st.session_state.messages = []
                 st.sidebar.success(f"Knowledge base built using {key_source}.")
             except Exception as e:
                 st.sidebar.error(f"Something went wrong building the pipeline: {e}")
 
 
-# ── Main chat area ──
 if "chain" in st.session_state:
     st.caption(f"Currently answering from: **{st.session_state.doc_name}**")
 
