@@ -1,5 +1,6 @@
 import re
 import json
+import time
 import hashlib
 import streamlit as st
 from langchain_groq import ChatGroq
@@ -12,13 +13,12 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
-import time
 
 st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-# Sidebar: user provides their own key if user has their own and document
+#Sidebar: user provides their own key if user has its own api key and document
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
@@ -31,37 +31,14 @@ with st.sidebar:
     st.divider()
     st.caption("Your key and document are only used for this session and are not stored.")
 
-def invoke_with_retry(chain, inputs, config, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            return chain.invoke(inputs, config=config)
-        except Exception as e:
-            if attempt == max_retries - 1:
-                return f"Sorry, the request failed after {max_retries} attempts: {e}"
-            time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
-
-with st.spinner("Thinking..."):
-    try:
-        answer = invoke_with_retry(
-            st.session_state.chain,
-            {"question": user_input},
-            config={"configurable": {"session_id": "streamlit_session"}}
-        )
-    except Exception as e:
-        answer = "Something went wrong processing that question. Please try again in a moment."
 
 def is_noise_chunk(text):
-    # Filters out chunks that are mostly bracketed headings / cross-reference
-    # index lines with little substantive content, which otherwise confuse
-    # the model into narrating its own uncertainty.
     stripped = text.strip()
     return bool(re.match(r'^\(Part\s+[IVX]+.*Arts?\.?\s*[\d\-–—,]+.*\)$', stripped))
 
 
 @st.cache_resource(show_spinner="Building knowledge base...")
 def load_pipeline(api_key, pdf_path, file_hash):
-    # file_hash forces a new cache entry whenever the uploaded file's content
-    # changes, so swapping documents doesn't silently reuse a stale pipeline.
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
@@ -76,24 +53,18 @@ def load_pipeline(api_key, pdf_path, file_hash):
     chunks = [c for c in chunks if not is_noise_chunk(c.page_content)]
 
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-    # In-memory only — keeps each session's vector store isolated so
-    # different users on a shared server never mix documents.
     vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
 
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
 
-    # Dynamic query decomposition: LLM decides if a question needs
-    # multiple separate retrievals (comparisons, multi-part questions),
-    # instead of relying on hardcoded regex patterns like "difference between".
     decompose_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Analyze this question. If it asks about TWO OR MORE distinct topics, "
          "articles, or sections that would each need a separate search to answer "
          "well — comparisons, relationships, multi-part questions — break it into "
-         "separate standalone search queries, one per topic. If it's a single-topic "
-         "question, return it unchanged as the only item.\n\n"
+         "separate standalone search queries, one per topic, MAXIMUM 3 topics. "
+         "If it's a single-topic question, return it unchanged as the only item.\n\n"
          "Output ONLY a JSON list of strings, nothing else, no explanation. "
          'Example: ["Article 14 equality before law", "Article 15 discrimination"] '
          'or ["Article 21 right to life"] for a single-topic question.'),
@@ -101,17 +72,20 @@ def load_pipeline(api_key, pdf_path, file_hash):
     ])
     decompose_chain = decompose_prompt | llm | StrOutputParser()
 
-   def decompose_query(query):
-    try:
-        raw = decompose_chain.invoke({"question": query}).strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`").replace("json", "", 1).strip()
-        sub_queries = json.loads(raw)
-        if isinstance(sub_queries, list) and sub_queries and all(isinstance(q, str) for q in sub_queries):
-            return sub_queries[:3] 
-    except Exception:
-        pass
-    return [query]
+    def decompose_query(query):
+        try:
+            raw = decompose_chain.invoke({"question": query}).strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").replace("json", "", 1).strip()
+            sub_queries = json.loads(raw)
+            if isinstance(sub_queries, list) and sub_queries and all(isinstance(q, str) for q in sub_queries):
+                # Cap at 3 sub-queries even if the LLM suggests more — this keeps
+                # the total LLM/embedding call count per question bounded, which
+                # matters on a rate-limited free tier.
+                return sub_queries[:3]
+        except Exception:
+            pass
+        return [query]
 
     def retrieve_and_rerank(query, top_k=3):
         sub_queries = decompose_query(query)
@@ -121,9 +95,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
         for sq in sub_queries:
             candidates = retriever.invoke(sq)
 
-            # Hybrid fix: force-include any chunk starting with a referenced
-            # section/article number, since plain semantic search often
-            # misses exact numeric/ID lookups.
             section_match = re.search(r'\b(\d{1,3}[A-Za-z]?)\b', sq)
             if section_match:
                 num = section_match.group(1)
@@ -135,7 +106,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
 
             all_candidates.extend(candidates)
 
-        # De-duplicate across sub-query results
         seen = set()
         unique_candidates = []
         for c in all_candidates:
@@ -146,8 +116,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
         if not unique_candidates:
             return []
 
-        # Score everything against the ORIGINAL question, not the sub-queries
-        # the final answer needs to address exactly what the user asked.
         pairs = [[query, doc.page_content] for doc in unique_candidates]
         scores = reranker.predict(pairs)
         ranked = sorted(zip(unique_candidates, scores), key=lambda x: x[1], reverse=True)
@@ -155,8 +123,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
         final_k = max(top_k, 2 * len(sub_queries)) if multi_topic else top_k
         return [doc for doc, score in ranked[:final_k]]
 
-    # Query contextualization: rewrite follow-up questions (with pronouns
-    # like "it" or "that") into standalone questions before retrieval. 
     contextualize_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Given the conversation history and a follow-up question, rewrite the "
@@ -176,8 +142,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
             "question": x["question"]
         })
 
-    # Hardened prompt: explicitly forbids falling back to outside/general
-    # knowledge, which was previously leaking into answers on partial matches.
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful assistant. Answer ONLY using the context below. "
@@ -212,7 +176,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
     )
 
 
-# Resolve which API key to actually use
 def resolve_api_key(user_provided_key):
     if user_provided_key:
         return user_provided_key, "your own key"
@@ -222,7 +185,24 @@ def resolve_api_key(user_provided_key):
         return None, None
 
 
-# Build step: only runs when the button is clicked 
+def invoke_with_retry(chain, inputs, config, max_retries=3):
+    """Retries the chain call with exponential backoff on transient API errors
+    (rate limits, timeouts) instead of letting the whole app crash."""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return chain.invoke(inputs, config=config)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)  # 1s, then 2s
+    return (
+        "Sorry, this request hit a temporary error after a few attempts "
+        f"(likely a rate limit or connection issue). Please try again in a moment. "
+        f"Details: {last_error}"
+    )
+
+
 if build_clicked:
     if not uploaded_file:
         st.sidebar.error("Please upload a PDF before building.")
@@ -250,7 +230,6 @@ if build_clicked:
                 st.sidebar.error(f"Something went wrong building the pipeline: {e}")
 
 
-# Main chat area
 if "chain" in st.session_state:
     st.caption(f"Currently answering from: **{st.session_state.doc_name}**")
 
@@ -263,7 +242,8 @@ if "chain" in st.session_state:
         st.chat_message("human").write(user_input)
 
         with st.spinner("Thinking..."):
-            answer = st.session_state.chain.invoke(
+            answer = invoke_with_retry(
+                st.session_state.chain,
                 {"question": user_input},
                 config={"configurable": {"session_id": "streamlit_session"}}
             )
