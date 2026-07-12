@@ -3,7 +3,7 @@ A RAG-based chatbot that answers questions from any PDF you give it — grounded
 
 I built this to actually understand how a production-grade RAG pipeline works, including the parts that don't show up in tutorials — chunking documents in a way that doesn't cut answers in half, catching cases where plain vector search quietly fails, and making follow-up questions actually work. Most of what's below came from debugging real failures on a real legal document, not from following a guide.
 
-**Live demo:** [https://ai-support-agent-ziwrcfrmdqskm8crjcxngl.streamlit.app]
+**Live demo:** [[https://ai-support-agent-ziwrcfrmdqskm8crjcxngl.streamlit.app]]
 
 ---
 
