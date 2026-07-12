@@ -2,6 +2,7 @@ import re
 import json
 import time
 import hashlib
+from collections import Counter
 import streamlit as st
 from langchain_groq import ChatGroq
 from langchain_community.document_loaders import PyPDFLoader
@@ -33,19 +34,44 @@ with st.sidebar:
 
 
 def is_noise_chunk(text):
+    # Filters chunks that are purely bracketed headings/cross-reference
+    # index lines with no real substantive content.
     stripped = text.strip()
     return bool(re.match(r'^\(Part\s+[IVX]+.*Arts?\.?\s*[\d\-–—,]+.*\)$', stripped))
+
+
+def is_repetitive_chunk(text, repetition_threshold=0.5):
+    """
+    Flags chunks dominated by a repeated line template (e.g. PDF extraction
+    artifacts like "Section 2(x) states that 'any State' includes...",
+    repeated dozens of times with only a letter/number changing). Feeding
+    these to the LLM as context can trigger runaway repetitive generation,
+    since the model tends to continue a strong pattern it sees in its input.
+    """
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    if len(lines) < 6:
+        return False  # too short to meaningfully judge repetition
+
+    def normalize(line):
+        # Collapse varying identifiers like (x), (y), (aa) so that lines
+        # differing only in that token are treated as the same template.
+        return re.sub(r'\([a-z]+\)', '(X)', line.lower())
+
+    normalized = [normalize(line) for line in lines]
+    counts = Counter(normalized)
+    most_common_count = counts.most_common(1)[0][1]
+
+    return (most_common_count / len(lines)) > repetition_threshold
 
 
 @st.cache_resource(show_spinner="Building knowledge base...")
 def load_pipeline(api_key, pdf_path, file_hash):
     llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    api_key=api_key,
-    temperature=0.0,
-    max_tokens=600 
+        model="llama-3.1-8b-instant",
+        api_key=api_key,
+        temperature=0.0,
+        max_tokens=600  # hard ceiling — prevents runaway repetitive generation
     )
-  
 
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
@@ -53,6 +79,7 @@ def load_pipeline(api_key, pdf_path, file_hash):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     chunks = [c for c in chunks if not is_noise_chunk(c.page_content)]
+    chunks = [c for c in chunks if not is_repetitive_chunk(c.page_content)]
 
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
@@ -81,9 +108,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
                 raw = raw.strip("`").replace("json", "", 1).strip()
             sub_queries = json.loads(raw)
             if isinstance(sub_queries, list) and sub_queries and all(isinstance(q, str) for q in sub_queries):
-                # Cap at 3 sub-queries even if the LLM suggests more — this keeps
-                # the total LLM/embedding call count per question bounded, which
-                # matters on a rate-limited free tier.
                 return sub_queries[:3]
         except Exception:
             pass
@@ -188,8 +212,6 @@ def resolve_api_key(user_provided_key):
 
 
 def invoke_with_retry(chain, inputs, config, max_retries=3):
-    """Retries the chain call with exponential backoff on transient API errors
-    (rate limits, timeouts) instead of letting the whole app crash."""
     last_error = None
     for attempt in range(max_retries):
         try:
@@ -197,7 +219,7 @@ def invoke_with_retry(chain, inputs, config, max_retries=3):
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # 1s, then 2s
+                time.sleep(2 ** attempt)
     return (
         "Sorry, this request hit a temporary error after a few attempts "
         f"(likely a rate limit or connection issue). Please try again in a moment. "
