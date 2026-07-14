@@ -69,7 +69,8 @@ def load_pipeline(api_key, pdf_path, file_hash):
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
-        temperature=0.0
+        temperature=0.0,
+        max_tokens=600  
     )
 
     loader = PyPDFLoader(pdf_path)
