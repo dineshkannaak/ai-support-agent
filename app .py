@@ -1,4 +1,5 @@
 import re
+import os
 import json
 import time
 import hashlib
@@ -14,12 +15,9 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
-import os
 
 # Use an authenticated Hugging Face token if one is configured in secrets —
-# this gives a higher, more reliable rate limit for downloading the
-# embedding and re-ranker model weights, instead of the shared unauthenticated
-# quota, which is more prone to slow or stalled downloads.
+# gives a higher, more reliable rate limit for downloading model weights.
 if "HF_TOKEN" in st.secrets:
     os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN"]
 
@@ -27,7 +25,6 @@ st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-# ── Sidebar: user provides their own key (optional) and document ──
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
@@ -42,9 +39,6 @@ with st.sidebar:
 
 
 def _log(msg, t0):
-    # Prints to terminal / Streamlit Cloud "Manage app" logs with elapsed
-    # time, so a hang shows exactly which stage it's stuck on instead of
-    # going completely silent with no way to diagnose it.
     print(f"[{time.perf_counter() - t0:6.1f}s] {msg}", flush=True)
 
 
@@ -68,12 +62,28 @@ def is_repetitive_chunk(text, repetition_threshold=0.5):
     return (most_common_count / len(lines)) > repetition_threshold
 
 
+def format_context(docs):
+    """
+    Wraps each retrieved chunk with an explicit, numbered source boundary
+    instead of silently concatenating them into one undifferentiated blob.
+    This is fully dynamic — it labels however many chunks come back (2, 3,
+    4, or more) with no hardcoded count. Paired with the system prompt's
+    instruction to only cite a section number if it appears within the same
+    labeled source, this prevents the model from blending content from one
+    chunk with a section number that actually belongs to a different chunk
+    — the exact failure pattern seen in testing (e.g. citing "Section 24"
+    with content that actually belongs to Section 84).
+    """
+    if not docs:
+        return "No relevant content was found in the document."
+    parts = []
+    for i, doc in enumerate(docs, start=1):
+        parts.append(f"--- Source {i} ---\n{doc.page_content.strip()}")
+    return "\n\n".join(parts)
+
+
 @st.cache_resource(show_spinner=False)
 def load_models():
-    # Loaded ONCE for the life of the app process, independent of which PDF
-    # is uploaded. Previously these lived inside load_pipeline(), so every
-    # new file_hash (i.e. any new PDF) forced a cache miss that reloaded —
-    # and potentially re-downloaded — both models from scratch.
     t0 = time.perf_counter()
     _log("Loading embedding model (all-MiniLM-L6-v2)...", t0)
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -90,7 +100,8 @@ def load_pipeline(api_key, pdf_path, file_hash):
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
-        temperature=0.0
+        temperature=0.0,
+        max_tokens=600
     )
 
     _log("Loading PDF...", t0)
@@ -193,14 +204,22 @@ def load_pipeline(api_key, pdf_path, file_hash):
             "question": x["question"]
         })
 
+    # ── Hardened prompt, now also instructed to respect source boundaries ──
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful assistant. Answer ONLY using the context below. "
+         "The context is divided into separate labeled sources (--- Source 1 ---, "
+         "--- Source 2 ---, etc.). Each source is an independent excerpt — content "
+         "and section/article numbers from DIFFERENT sources must NEVER be mixed "
+         "together. Only state that a fact belongs to a specific section or article "
+         "number if that exact number and its content appear together WITHIN THE "
+         "SAME source block. If you are not sure which source a section number "
+         "belongs to, say so explicitly rather than guessing.\n\n"
          "Never use any outside knowledge, even if you are confident it is correct. "
          "If the context is incomplete or only partially answers the question, "
          "explicitly say what is missing rather than filling the gap yourself. "
          "If the answer is not in the context, say: I don't know, that information "
-         "is not in the document.\n\nContext: {context}"),
+         "is not in the document.\n\nContext:\n{context}"),
         MessagesPlaceholder(variable_name="chat_history"),
         ("human", "{question}")
     ])
@@ -213,7 +232,9 @@ def load_pipeline(api_key, pdf_path, file_hash):
 
     inner_chain = (
         {
-            "context": lambda x: retrieve_and_rerank(get_standalone_question(x)),
+            # format_context wraps however many chunks come back with
+            # numbered "--- Source N ---" labels, dynamically — no fixed count.
+            "context": lambda x: format_context(retrieve_and_rerank(get_standalone_question(x))),
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", [])
         }
