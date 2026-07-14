@@ -19,7 +19,7 @@ st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-#Sidebar: user provides their own key if user has its own api key and document
+# Sidebar: user provides their own key if user has its own api key and document
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
@@ -31,6 +31,12 @@ with st.sidebar:
     build_clicked = st.button("Build Knowledge Base", type="primary")
     st.divider()
     st.caption("Your key and document are only used for this session and are not stored.")
+
+
+def _log(msg, t0):
+    # Prints to terminal / Streamlit Cloud "Manage app" logs with elapsed time,
+    # so a hang shows exactly which stage it's stuck on.
+    print(f"[{time.perf_counter() - t0:6.1f}s] {msg}", flush=True)
 
 
 def is_noise_chunk(text):
@@ -64,27 +70,56 @@ def is_repetitive_chunk(text, repetition_threshold=0.5):
     return (most_common_count / len(lines)) > repetition_threshold
 
 
+@st.cache_resource(show_spinner=False)
+def load_models():
+    """
+    Loads the embedding model and cross-encoder reranker ONCE for the
+    life of the app process, independent of which PDF is uploaded.
+    Previously these lived inside load_pipeline(), so a new file_hash
+    (i.e. any new PDF) forced Streamlit's cache to treat it as a cache
+    miss and re-instantiate both models from scratch — re-downloading
+    ~90MB+ each from HuggingFace Hub if the weights weren't already on
+    local disk. On Streamlit Community Cloud's free tier, storage is
+    ephemeral and can reset between sessions, so this could silently
+    re-trigger full downloads that look like a stuck spinner.
+    """
+    t0 = time.perf_counter()
+    _log("Loading embedding model (all-MiniLM-L6-v2)...", t0)
+    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    _log("Embedding model loaded. Loading reranker (ms-marco-MiniLM-L-6-v2)...", t0)
+    reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+    _log("Reranker loaded.", t0)
+    return embeddings, reranker
+
+
 @st.cache_resource(show_spinner="Building knowledge base...")
 def load_pipeline(api_key, pdf_path, file_hash):
+    t0 = time.perf_counter()
+
     llm = ChatGroq(
         model="llama-3.1-8b-instant",
         api_key=api_key,
         temperature=0.0,
-        max_tokens=600  
+        max_tokens=600
     )
 
+    _log("Loading PDF...", t0)
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
+    _log(f"PDF loaded ({len(docs)} pages). Splitting into chunks...", t0)
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     chunks = [c for c in chunks if not is_noise_chunk(c.page_content)]
     chunks = [c for c in chunks if not is_repetitive_chunk(c.page_content)]
+    _log(f"{len(chunks)} chunks after filtering. Fetching models...", t0)
 
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    embeddings, reranker = load_models()
+    _log("Models ready. Embedding chunks into Chroma (this is the slow step for large PDFs)...", t0)
+
     vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings)
+    _log("Vectorstore built.", t0)
 
-    reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     retriever = vectorstore.as_retriever(search_kwargs={"k": 25})
 
     decompose_prompt = ChatPromptTemplate.from_messages([
@@ -194,6 +229,8 @@ def load_pipeline(api_key, pdf_path, file_hash):
         }
         | prompt | llm | StrOutputParser()
     )
+
+    _log("Pipeline ready.", t0)
 
     return RunnableWithMessageHistory(
         inner_chain, get_session_history,
