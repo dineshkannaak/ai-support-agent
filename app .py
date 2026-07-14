@@ -14,12 +14,20 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
+import os
+
+# Use an authenticated Hugging Face token if one is configured in secrets —
+# this gives a higher, more reliable rate limit for downloading the
+# embedding and re-ranker model weights, instead of the shared unauthenticated
+# quota, which is more prone to slow or stalled downloads.
+if "HF_TOKEN" in st.secrets:
+    os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN"]
 
 st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
 
-# Sidebar: user provides their own key if user has its own api key and document
+# ── Sidebar: user provides their own key (optional) and document ──
 with st.sidebar:
     st.header("Setup")
     user_api_key = st.text_input(
@@ -34,33 +42,23 @@ with st.sidebar:
 
 
 def _log(msg, t0):
-    # Prints to terminal / Streamlit Cloud "Manage app" logs with elapsed time,
-    # so a hang shows exactly which stage it's stuck on.
+    # Prints to terminal / Streamlit Cloud "Manage app" logs with elapsed
+    # time, so a hang shows exactly which stage it's stuck on instead of
+    # going completely silent with no way to diagnose it.
     print(f"[{time.perf_counter() - t0:6.1f}s] {msg}", flush=True)
 
 
 def is_noise_chunk(text):
-    # Filters chunks that are purely bracketed headings/cross-reference
-    # index lines with no real substantive content.
     stripped = text.strip()
     return bool(re.match(r'^\(Part\s+[IVX]+.*Arts?\.?\s*[\d\-–—,]+.*\)$', stripped))
 
 
 def is_repetitive_chunk(text, repetition_threshold=0.5):
-    """
-    Flags chunks dominated by a repeated line template (e.g. PDF extraction
-    artifacts like "Section 2(x) states that 'any State' includes...",
-    repeated dozens of times with only a letter/number changing). Feeding
-    these to the LLM as context can trigger runaway repetitive generation,
-    since the model tends to continue a strong pattern it sees in its input.
-    """
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if len(lines) < 6:
-        return False  # too short to meaningfully judge repetition
+        return False
 
     def normalize(line):
-        # Collapse varying identifiers like (x), (y), (aa) so that lines
-        # differing only in that token are treated as the same template.
         return re.sub(r'\([a-z]+\)', '(X)', line.lower())
 
     normalized = [normalize(line) for line in lines]
@@ -72,17 +70,10 @@ def is_repetitive_chunk(text, repetition_threshold=0.5):
 
 @st.cache_resource(show_spinner=False)
 def load_models():
-    """
-    Loads the embedding model and cross-encoder reranker ONCE for the
-    life of the app process, independent of which PDF is uploaded.
-    Previously these lived inside load_pipeline(), so a new file_hash
-    (i.e. any new PDF) forced Streamlit's cache to treat it as a cache
-    miss and re-instantiate both models from scratch — re-downloading
-    ~90MB+ each from HuggingFace Hub if the weights weren't already on
-    local disk. On Streamlit Community Cloud's free tier, storage is
-    ephemeral and can reset between sessions, so this could silently
-    re-trigger full downloads that look like a stuck spinner.
-    """
+    # Loaded ONCE for the life of the app process, independent of which PDF
+    # is uploaded. Previously these lived inside load_pipeline(), so every
+    # new file_hash (i.e. any new PDF) forced a cache miss that reloaded —
+    # and potentially re-downloaded — both models from scratch.
     t0 = time.perf_counter()
     _log("Loading embedding model (all-MiniLM-L6-v2)...", t0)
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
