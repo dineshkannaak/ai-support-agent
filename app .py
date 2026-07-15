@@ -22,6 +22,7 @@ if "HF_TOKEN" in st.secrets:
 st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
+
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 
@@ -70,7 +71,7 @@ def format_context(docs):
     return "\n\n".join(parts)
 
 
-# Dynamic conversational filler detection 
+# ── Dynamic conversational filler detection ──
 _QUESTION_INDICATORS = {
     "what", "why", "how", "who", "when", "where", "which", "does", "do",
     "did", "is", "are", "was", "were", "can", "could", "would", "should",
@@ -125,10 +126,6 @@ META_RESPONSE = (
     "section, article, or topic instead — for example, \"What does Section "
     "302 say?\" or \"What's the punishment for theft?\""
 )
-
-# Fixed, non-negotiable answer used whenever retrieval finds nothing
-# relevant. See the grounding fix below for why this is enforced in code
-# instead of only via the system prompt.
 NO_CONTEXT_ANSWER = "I don't know, that information is not in the document."
 
 
@@ -203,7 +200,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
         sub_queries = decompose_query(query)
         multi_topic = len(sub_queries) > 1
 
-     .
         forced_docs = []
         forced_seen = set()
         semantic_pairs = []
