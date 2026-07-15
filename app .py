@@ -2,6 +2,7 @@ import re
 import os
 import json
 import time
+import uuid
 import hashlib
 from collections import Counter
 import streamlit as st
@@ -11,7 +12,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
@@ -22,6 +22,8 @@ if "HF_TOKEN" in st.secrets:
 st.set_page_config(page_title="Support Agent", page_icon="🤖", initial_sidebar_state="expanded")
 st.title("AI Document Q&A Agent")
 st.caption("Upload a PDF and ask questions about it — answers are grounded strictly in the document.")
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 with st.sidebar:
     st.header("Setup")
@@ -68,21 +70,21 @@ def format_context(docs):
     return "\n\n".join(parts)
 
 
-# ── Dynamic conversational filler detection ──
-# Instead of matching against a fixed list of exact phrases (which can never
-# cover every real phrasing — "ok got it" and "nice thanks for that" both
-# slipped through a hardcoded list in testing), this uses a small set of
-# general signals that generalize to phrasings never seen before:
-#   - contains a question mark → NOT filler
-#   - contains a digit (likely referencing a section/article number) → NOT filler
-#   - contains any typical question/request word → NOT filler
-#   - otherwise, short (<= 6 words) → treated as filler
+# Dynamic conversational filler detection 
 _QUESTION_INDICATORS = {
     "what", "why", "how", "who", "when", "where", "which", "does", "do",
     "did", "is", "are", "was", "were", "can", "could", "would", "should",
     "will", "explain", "tell", "describe", "define", "compare", "summarize",
     "summarise", "list", "give", "show"
 }
+
+_FILLER_TERMS = {
+    "ok", "okay", "kk", "k", "thanks", "thank", "thankyou", "thx", "ty",
+    "cool", "great", "nice", "perfect", "awesome", "sure", "alright",
+    "got", "it", "understood", "noted", "appreciate", "appreciated",
+    "welcome", "yep", "yeah", "yup", "no", "yes", "please", "good", "fine"
+}
+
 
 def is_conversational_filler(text):
     stripped = text.strip()
@@ -91,13 +93,15 @@ def is_conversational_filler(text):
     if "?" in stripped:
         return False
     if re.search(r'\d', stripped):
-        return False  # mentions a number — likely a real reference, not filler
+        return False
     words = re.findall(r"[a-zA-Z']+", stripped.lower())
     if not words:
         return True
     if any(w in _QUESTION_INDICATORS for w in words):
         return False
-    return len(words) <= 6
+    if len(words) <= 3 and all(w in _FILLER_TERMS for w in words):
+        return True
+    return False
 
 
 _META_PATTERNS = [
@@ -108,9 +112,11 @@ _META_PATTERNS = [
     r'\bsummar(y|ize) (the )?whole (ipc|document|pdf|file)\b',
 ]
 
+
 def is_meta_question(text):
     lowered = text.strip().lower()
     return any(re.search(p, lowered) for p in _META_PATTERNS)
+
 
 META_RESPONSE = (
     "I answer specific questions about the document's content rather than "
@@ -119,6 +125,11 @@ META_RESPONSE = (
     "section, article, or topic instead — for example, \"What does Section "
     "302 say?\" or \"What's the punishment for theft?\""
 )
+
+# Fixed, non-negotiable answer used whenever retrieval finds nothing
+# relevant. See the grounding fix below for why this is enforced in code
+# instead of only via the system prompt.
+NO_CONTEXT_ANSWER = "I don't know, that information is not in the document."
 
 
 @st.cache_resource(show_spinner=False)
@@ -188,45 +199,52 @@ def load_pipeline(api_key, pdf_path, file_hash):
             pass
         return [query]
 
-    def retrieve_and_rerank(query, top_k=3):
+    def retrieve_and_rerank(query, top_k=3, max_forced=6):
         sub_queries = decompose_query(query)
         multi_topic = len(sub_queries) > 1
 
-        all_candidates = []
+     .
+        forced_docs = []
+        forced_seen = set()
+        semantic_pairs = []
+        semantic_seen = set()
+
         for sq in sub_queries:
             candidates = retriever.invoke(sq)
+            for c in candidates:
+                if c.page_content not in semantic_seen:
+                    semantic_seen.add(c.page_content)
+                    semantic_pairs.append((c, sq))
 
-            # FIXED: findall instead of search — catches EVERY section/article
-            # number mentioned in a sub-query, not just the first one. This
-            # was a real bug: "Section 34 and Section 149" previously only
-            # force-included a match for 34, leaving 149 to pure semantic
-            # search, which could miss it entirely.
             section_numbers = set(re.findall(r'\b(\d{1,3}[A-Za-z]?)\b', sq))
             for num in section_numbers:
                 for chunk in chunks:
                     stripped = chunk.page_content.strip()
                     if stripped.startswith(f"{num}.") or f"\n{num}." in chunk.page_content:
-                        if chunk not in candidates:
-                            candidates.append(chunk)
+                        if chunk.page_content not in forced_seen:
+                            forced_seen.add(chunk.page_content)
+                            forced_docs.append(chunk)
 
-            all_candidates.extend(candidates)
+        forced_docs = forced_docs[:max_forced]
+        semantic_pairs = [(d, sq) for (d, sq) in semantic_pairs if d.page_content not in forced_seen]
 
-        seen = set()
-        unique_candidates = []
-        for c in all_candidates:
-            if c.page_content not in seen:
-                seen.add(c.page_content)
-                unique_candidates.append(c)
-
-        if not unique_candidates:
+        if not forced_docs and not semantic_pairs:
             return []
 
-        pairs = [[query, doc.page_content] for doc in unique_candidates]
-        scores = reranker.predict(pairs)
-        ranked = sorted(zip(unique_candidates, scores), key=lambda x: x[1], reverse=True)
+        base_budget = max(top_k, 2 * len(sub_queries)) if multi_topic else top_k
+        remaining_budget = max(0, base_budget - len(forced_docs))
 
-        final_k = max(top_k, 2 * len(sub_queries)) if multi_topic else top_k
-        return [doc for doc, score in ranked[:final_k]]
+        ranked_semantic = []
+        if semantic_pairs and remaining_budget > 0:
+            pairs = [[sq, doc.page_content] for doc, sq in semantic_pairs]
+            scores = reranker.predict(pairs)
+            ranked = sorted(
+                zip([d for d, _ in semantic_pairs], scores),
+                key=lambda x: x[1], reverse=True
+            )
+            ranked_semantic = [doc for doc, score in ranked[:remaining_budget]]
+
+        return forced_docs + ranked_semantic
 
     contextualize_prompt = ChatPromptTemplate.from_messages([
         ("system",
@@ -239,12 +257,12 @@ def load_pipeline(api_key, pdf_path, file_hash):
     ])
     contextualize_chain = contextualize_prompt | llm | StrOutputParser()
 
-    def get_standalone_question(x):
-        if not x.get("chat_history"):
-            return x["question"]
+    def get_standalone_question(question, chat_history):
+        if not chat_history:
+            return question
         return contextualize_chain.invoke({
-            "chat_history": x["chat_history"],
-            "question": x["question"]
+            "chat_history": chat_history,
+            "question": question
         })
 
     prompt = ChatPromptTemplate.from_messages([
@@ -270,28 +288,35 @@ def load_pipeline(api_key, pdf_path, file_hash):
         ("human", "{question}")
     ])
 
+    answer_chain = prompt | llm | StrOutputParser()
+
     store = {}
+
     def get_session_history(session_id):
         if session_id not in store:
             store[session_id] = ChatMessageHistory()
         return store[session_id]
 
-    inner_chain = (
-        {
-            "context": lambda x: format_context(retrieve_and_rerank(get_standalone_question(x))),
-            "question": lambda x: x["question"],
-            "chat_history": lambda x: x.get("chat_history", [])
-        }
-        | prompt | llm | StrOutputParser()
-    )
+    def answer_question(question, session_id):
+        history = get_session_history(session_id)
+        standalone_question = get_standalone_question(question, history.messages)
+        docs = retrieve_and_rerank(standalone_question)
+
+        if not docs:
+            answer_text = NO_CONTEXT_ANSWER
+        else:
+            context = format_context(docs)
+            answer_text = invoke_with_retry(
+                answer_chain,
+                {"context": context, "chat_history": history.messages, "question": question}
+            )
+
+        history.add_user_message(question)
+        history.add_ai_message(answer_text)
+        return answer_text
 
     _log("Pipeline ready.", t0)
-
-    return RunnableWithMessageHistory(
-        inner_chain, get_session_history,
-        input_messages_key="question",
-        history_messages_key="chat_history"
-    )
+    return answer_question
 
 
 def resolve_api_key(user_provided_key):
@@ -303,11 +328,11 @@ def resolve_api_key(user_provided_key):
         return None, None
 
 
-def invoke_with_retry(chain, inputs, config, max_retries=3):
+def invoke_with_retry(chain, inputs, max_retries=3):
     last_error = None
     for attempt in range(max_retries):
         try:
-            return chain.invoke(inputs, config=config)
+            return chain.invoke(inputs)
         except Exception as e:
             last_error = e
             if attempt < max_retries - 1:
@@ -338,7 +363,7 @@ if build_clicked:
                 f.write(file_bytes)
 
             try:
-                st.session_state.chain = load_pipeline(api_key, temp_pdf_path, file_hash)
+                st.session_state.answer_fn = load_pipeline(api_key, temp_pdf_path, file_hash)
                 st.session_state.doc_name = uploaded_file.name
                 st.session_state.messages = []
                 st.sidebar.success(f"Knowledge base built using {key_source}.")
@@ -346,7 +371,7 @@ if build_clicked:
                 st.sidebar.error(f"Something went wrong building the pipeline: {e}")
 
 
-if "chain" in st.session_state:
+if "answer_fn" in st.session_state:
     st.caption(f"Currently answering from: **{st.session_state.doc_name}**")
 
     for msg in st.session_state.messages:
@@ -363,11 +388,7 @@ if "chain" in st.session_state:
             answer = META_RESPONSE
         else:
             with st.spinner("Thinking..."):
-                answer = invoke_with_retry(
-                    st.session_state.chain,
-                    {"question": user_input},
-                    config={"configurable": {"session_id": "streamlit_session"}}
-                )
+                answer = st.session_state.answer_fn(user_input, st.session_state.session_id)
 
         st.session_state.messages.append({"role": "ai", "content": answer})
         st.chat_message("ai").write(answer)
