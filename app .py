@@ -16,8 +16,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_message_histories import ChatMessageHistory
 from sentence_transformers import CrossEncoder
 
-# Use an authenticated Hugging Face token if one is configured in secrets —
-# gives a higher, more reliable rate limit for downloading model weights.
+# Use an authenticated Hugging Face token if configured — gives a higher,
+# more reliable rate limit for downloading model weights, reducing the
+# chance of a stalled download (this was the cause of the earlier
+# multi-minute hang on first load).
 if "HF_TOKEN" in st.secrets:
     os.environ["HF_TOKEN"] = st.secrets["HF_TOKEN"]
 
@@ -39,15 +41,22 @@ with st.sidebar:
 
 
 def _log(msg, t0):
+    # Prints to Streamlit Cloud "Manage app" logs with elapsed time, so a
+    # hang shows exactly which stage it's stuck on.
     print(f"[{time.perf_counter() - t0:6.1f}s] {msg}", flush=True)
 
 
 def is_noise_chunk(text):
+    # Filters chunks that are purely bracketed headings/cross-reference
+    # index lines with no real substantive content.
     stripped = text.strip()
     return bool(re.match(r'^\(Part\s+[IVX]+.*Arts?\.?\s*[\d\-–—,]+.*\)$', stripped))
 
 
 def is_repetitive_chunk(text, repetition_threshold=0.5):
+    # Flags chunks dominated by a repeated line template (PDF extraction
+    # artifacts). Feeding these to the LLM can trigger runaway repetitive
+    # generation.
     lines = [line.strip() for line in text.split('\n') if line.strip()]
     if len(lines) < 6:
         return False
@@ -58,22 +67,14 @@ def is_repetitive_chunk(text, repetition_threshold=0.5):
     normalized = [normalize(line) for line in lines]
     counts = Counter(normalized)
     most_common_count = counts.most_common(1)[0][1]
-
     return (most_common_count / len(lines)) > repetition_threshold
 
 
 def format_context(docs):
-    """
-    Wraps each retrieved chunk with an explicit, numbered source boundary
-    instead of silently concatenating them into one undifferentiated blob.
-    This is fully dynamic — it labels however many chunks come back (2, 3,
-    4, or more) with no hardcoded count. Paired with the system prompt's
-    instruction to only cite a section number if it appears within the same
-    labeled source, this prevents the model from blending content from one
-    chunk with a section number that actually belongs to a different chunk
-    — the exact failure pattern seen in testing (e.g. citing "Section 24"
-    with content that actually belongs to Section 84).
-    """
+    # Wraps each retrieved chunk with an explicit, numbered source boundary
+    # instead of silently concatenating them. Fully dynamic — labels however
+    # many chunks come back, no hardcoded count. Prevents the model from
+    # blending content from one chunk with a section number from another.
     if not docs:
         return "No relevant content was found in the document."
     parts = []
@@ -82,8 +83,54 @@ def format_context(docs):
     return "\n\n".join(parts)
 
 
+# ── Conversational filler detection ──
+# Plain acknowledgements ("ok thanks", "got it") should NOT trigger a new
+# retrieval + contextualization pass. Previously, ANY message — including
+# non-questions — went through contextualization and retrieval, which could
+# pull unrelated chunks and cause the model to wrongly retract a correct
+# earlier answer because the new, unrelated context didn't support it.
+_FILLER_PHRASES = {
+    "ok", "okay", "ok thanks", "okay thanks", "thanks", "thank you",
+    "got it", "cool", "nice", "great", "alright", "k", "kk", "thx",
+    "sounds good", "perfect", "understood", "noted"
+}
+
+def is_conversational_filler(text):
+    cleaned = text.strip().lower().rstrip(".!")
+    return cleaned in _FILLER_PHRASES
+
+
+# ── Meta-question detection ──
+# "Tell me about this PDF" / "summarize this document" cannot be answered
+# reliably by chunk-based retrieval, since no single retrieval call ever
+# sees the whole document — different phrasings of the same meta-question
+# pull different random chunks and produce inconsistent answers. Give a
+# fixed, honest response instead of running the normal pipeline on these.
+_META_PATTERNS = [
+    r'\babout this (pdf|document|file)\b',
+    r'\bsummar(y|ize) (this|the) (pdf|document|file)\b',
+    r'\bwhat is this (pdf|document|file)\b',
+    r'\bwhat.?s (this|in) (the )?(pdf|document|file) about\b',
+]
+
+def is_meta_question(text):
+    lowered = text.strip().lower()
+    return any(re.search(p, lowered) for p in _META_PATTERNS)
+
+META_RESPONSE = (
+    "I answer specific questions about the document's content rather than "
+    "giving a general summary, since I only ever see small relevant excerpts "
+    "at a time, not the whole document at once. Try asking about a specific "
+    "section, article, or topic instead — for example, \"What does Section "
+    "302 say?\" or \"What's the punishment for theft?\""
+)
+
+
 @st.cache_resource(show_spinner=False)
 def load_models():
+    # Loaded ONCE for the life of the app process, independent of which PDF
+    # is uploaded — switching documents no longer re-triggers a model
+    # re-download.
     t0 = time.perf_counter()
     _log("Loading embedding model (all-MiniLM-L6-v2)...", t0)
     embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -204,7 +251,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
             "question": x["question"]
         })
 
-    # ── Hardened prompt, now also instructed to respect source boundaries ──
     prompt = ChatPromptTemplate.from_messages([
         ("system",
          "You are a helpful assistant. Answer ONLY using the context below. "
@@ -232,8 +278,6 @@ def load_pipeline(api_key, pdf_path, file_hash):
 
     inner_chain = (
         {
-            # format_context wraps however many chunks come back with
-            # numbered "--- Source N ---" labels, dynamically — no fixed count.
             "context": lambda x: format_context(retrieve_and_rerank(get_standalone_question(x))),
             "question": lambda x: x["question"],
             "chat_history": lambda x: x.get("chat_history", [])
@@ -313,12 +357,23 @@ if "chain" in st.session_state:
         st.session_state.messages.append({"role": "human", "content": user_input})
         st.chat_message("human").write(user_input)
 
-        with st.spinner("Thinking..."):
-            answer = invoke_with_retry(
-                st.session_state.chain,
-                {"question": user_input},
-                config={"configurable": {"session_id": "streamlit_session"}}
-            )
+        if is_conversational_filler(user_input):
+            # Skip retrieval and contextualization entirely for plain
+            # acknowledgements — nothing to look up, and running the full
+            # pipeline here was what previously caused a correct earlier
+            # answer to get wrongly retracted.
+            answer = "You're welcome! Let me know if you have another question about the document."
+        elif is_meta_question(user_input):
+            # Skip the pipeline for whole-document summary requests, which
+            # chunk-based retrieval can't answer reliably or consistently.
+            answer = META_RESPONSE
+        else:
+            with st.spinner("Thinking..."):
+                answer = invoke_with_retry(
+                    st.session_state.chain,
+                    {"question": user_input},
+                    config={"configurable": {"session_id": "streamlit_session"}}
+                )
 
         st.session_state.messages.append({"role": "ai", "content": answer})
         st.chat_message("ai").write(answer)
